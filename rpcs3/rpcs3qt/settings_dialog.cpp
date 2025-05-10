@@ -398,6 +398,10 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	spu_bg->addButton(ui->spu_asmjit,  static_cast<int>(spu_decoder_type::asmjit));
 	spu_bg->addButton(ui->spu_llvm,    static_cast<int>(spu_decoder_type::llvm));
 
+#ifndef ARCH_X64
+	ui->spu_asmjit->setEnabled(false);
+#endif
+
 	connect(spu_bg, &QButtonGroup::idToggled, [this](int id, bool checked)
 	{
 		if (!checked) return;
@@ -1597,6 +1601,9 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 
 	m_emu_settings->EnhanceCheckBox(ui->disableSpinOptimization, emu_settings_type::DisableSpinOptimization);
 	SubscribeTooltip(ui->disableSpinOptimization, tooltips.settings.disable_spin_optimization);
+
+	m_emu_settings->EnhanceCheckBox(ui->enableSpuEventsBusyLoop, emu_settings_type::EnabledSPUEventsBusyLoop);
+	SubscribeTooltip(ui->enableSpuEventsBusyLoop, tooltips.settings.enable_spu_events_busy_loop);
 
 	// Comboboxes
 

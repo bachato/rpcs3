@@ -2873,7 +2873,7 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
 		Emu.SetContinuousMode(false);
 	}
 
-	// Ensure no game has booted inbetween
+	// Ensure no game has booted in between
 	const auto guard = Emu.MakeEmulationStateGuard();
 
 	stop_counter_t old_emu_id{};
@@ -2920,8 +2920,20 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
 
 	const u64 read_counter = get_sysutil_cb_manager_read_count();
 
-	if (old_state == system_state::frozen || savestate || !sysutil_send_system_cmd(0x0101 /* CELL_SYSUTIL_REQUEST_EXITGAME */, 0))
+	const bool force_termination = old_state == system_state::frozen || savestate;
+
+	if (!force_termination)
 	{
+		sys_log.notice("Requesting game to exit...");
+	}
+
+	if (force_termination || !sysutil_send_system_cmd(0x0101 /* CELL_SYSUTIL_REQUEST_EXITGAME */, 0))
+	{
+		if (!force_termination)
+		{
+			sys_log.warning("The game ignored the exit request. Forcing termination...");
+		}
+
 		// The callback has been rudely ignored, we have no other option but to force termination
 		Kill(allow_autoexit && !savestate, savestate);
 
@@ -2936,15 +2948,21 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
 		return;
 	}
 
-	auto perform_kill = [read_counter, allow_autoexit, this, info = GetEmulationIdentifier()]()
+	sys_log.notice("The game was requested to exit. Waiting for its reaction...");
+
+	auto perform_kill = [read_counter, allow_autoexit, this, info = old_emu_id]()
 	{
 		bool read_sysutil_signal = false;
+		std::vector<stx::shared_ptr<named_thread<ppu_thread>>> ppu_thread_list;
 
-		u32 i = 100;
+		// If EXITGAME signal is not read, force kill after a second.
+		constexpr int loop_timeout_ms = 50;
+		int kill_timeout_ms = 1000;
+		int elapsed_ms = 0;
 
-		qt_events_aware_op(50, [&]()
+		qt_events_aware_op(loop_timeout_ms, [&]()
 		{
-			if (i >= 140)
+			if (elapsed_ms >= kill_timeout_ms)
 			{
 				return true;
 			}
@@ -2955,25 +2973,60 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
 				Resume();
 			}, nullptr, true, read_counter);
 
+			// Check if the EXITGAME signal was read. We allow the game to terminate itself if that's the case.
 			if (!read_sysutil_signal && read_counter != get_sysutil_cb_manager_read_count())
 			{
-				i -= 100; // Grant 5 seconds (if signal is not read force kill after two second)
+				sys_log.notice("The game received the exit request. Waiting for it to terminate itself...");
+				kill_timeout_ms += 5000; // Grant a couple more seconds
 				read_sysutil_signal = true;
+
+				// Observe PPU threads state since this stage
+				idm::select<named_thread<ppu_thread>>([&](u32 id, cpu_thread&)
+				{
+					ppu_thread_list.emplace_back(idm::get_unlocked<named_thread<ppu_thread>>(id));
+				});
 			}
 
-			if (static_cast<u64>(info) != m_stop_ctr)
+			if (static_cast<u64>(info) != m_stop_ctr || Emu.IsStopped())
 			{
 				return true;
 			}
 
+			if (read_sysutil_signal && kill_timeout_ms - elapsed_ms <= 1'500)
+			{
+				int thread_exited_count = 0;
+
+				for (auto& ppu : ppu_thread_list)
+				{
+					if (ppu && (ppu->state & cpu_flag::exit || ppu->joiner == ppu_join_status::zombie))
+					{
+						ppu.reset();
+						thread_exited_count++;
+					}
+				}
+
+				if (thread_exited_count)
+				{
+					// If some threads exited since last check, grant additional 250 miliseconds
+					kill_timeout_ms += 250;
+					sys_log.notice("Threads were terminated.. increasing termination timeout (threads=%d)", thread_exited_count);
+				}
+			}
+
 			// Process events
-			i++;
+			elapsed_ms += loop_timeout_ms;
 			return false;
 		});
 
-		// An inevitable attempt to terminate the *current* emulation course will be issued after 7s
-		CallFromMainThread([allow_autoexit, this]()
+		// An inevitable attempt to terminate the *current* emulation course will be issued after the timeout was reached.
+		CallFromMainThread([this, allow_autoexit, elapsed_ms, read_sysutil_signal]()
 		{
+			if (Emu.IsStopped())
+			{
+				return;
+			}
+
+			sys_log.error("The game did not react to the exit request in time. Terminating manually... (read_sysutil_signal=%d, elapsed_ms=%d)", read_sysutil_signal, elapsed_ms);
 			Kill(allow_autoexit);
 		}, info);
 	};
